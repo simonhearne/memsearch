@@ -412,10 +412,24 @@ kill_orphaned_index() {
   fi
 
   # 3. Kill orphaned milvus_lite processes (they don't exit when memsearch index exits)
+  #    Only the server for memsearch's own database: other apps on this machine run
+  #    their own milvus_lite servers, and pgrep alone would match those too.
+  local uri db_dir db
+  uri="${MILVUS_URI:-$(_memsearch config get milvus.uri 2>/dev/null || echo "")}"
+  uri="${uri:-$HOME/.memsearch/milvus.db}"
+  if [[ "$uri" == http* ]] || [[ "$uri" == tcp* ]]; then
+    return 0
+  fi
+  uri="$(project_path "${uri/#\~/$HOME}")"
+  # milvus_lite passes the fully resolved path (e.g. /tmp -> /private/tmp on macOS)
+  db_dir="$(cd "$(dirname "$uri")" 2>/dev/null && pwd -P)" || return 0
+  db="$db_dir/$(basename "$uri")"
   orphans=$(pgrep -f "milvus_lite/lib/milvus" 2>/dev/null || true)
   if [ -n "$orphans" ]; then
     echo "$orphans" | while read -r opid; do
-      kill "$opid" 2>/dev/null || true
+      if [[ "$(ps -o command= -p "$opid" 2>/dev/null)" == *"milvus $db "* ]]; then
+        kill "$opid" 2>/dev/null || true
+      fi
     done
   fi
 }

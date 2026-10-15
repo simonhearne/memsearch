@@ -935,8 +935,10 @@ echo "- User discussed a macOS stop hook regression."
     ("milvus_uri", "expected_index_calls", "expected_pgrep_calls"),
     [
         ("/tmp/memsearch-lite.db", 0, 0),
-        ("http://127.0.0.1:19530", 1, 2),
-        ("tcp://127.0.0.1:19530", 1, 2),
+        # Server mode sweeps stale index processes only: there is no memsearch
+        # Milvus Lite server to look for.
+        ("http://127.0.0.1:19530", 1, 1),
+        ("tcp://127.0.0.1:19530", 1, 1),
     ],
     ids=["lite", "http-server", "tcp-server"],
 )
@@ -2186,3 +2188,94 @@ def test_version_gt_orders_supported_versions(common_sh: str) -> None:
     got = result.stdout.split()
     want = ["gt" if expected else "not" for _, _, expected in cases]
     assert got == want, [(c, g, w) for c, g, w in zip(cases, got, want, strict=True) if g != w]
+
+
+@pytest.mark.parametrize(
+    ("milvus_uri", "expect_own_killed"),
+    [("~/.memsearch/milvus.db", True), ("http://127.0.0.1:19530", False)],
+    ids=["lite", "server"],
+)
+@pytest.mark.parametrize("common_sh", COMMON_SHS, ids=PLUGIN_IDS)
+def test_kill_orphaned_index_only_kills_memsearch_milvus_lite(
+    tmp_path: Path, common_sh: str, milvus_uri: str, expect_own_killed: bool
+) -> None:
+    """The sweep must not SIGTERM Milvus Lite servers owned by other apps on the
+    machine: only the one serving memsearch's own database file."""
+    home = tmp_path / "home"
+    (home / ".memsearch").mkdir(parents=True)
+    own_db = home / ".memsearch" / "milvus.db"
+    own_db.touch()
+    other_db = tmp_path / "other-app" / "milvus.db"
+    other_db.parent.mkdir()
+    other_db.touch()
+
+    # Stand-in for the milvus_lite server binary; argv mirrors milvus_lite's
+    # Server.args: <db> <uds> <log level> <lock>, with the db path fully resolved.
+    fake_milvus = tmp_path / "site-packages" / "milvus_lite" / "lib" / "milvus"
+    fake_milvus.parent.mkdir(parents=True)
+    _write_executable(fake_milvus, "#!/usr/bin/env bash\nsleep 60\n")
+
+    def spawn(db: Path) -> subprocess.Popen:
+        db = db.resolve()
+        return subprocess.Popen(
+            [
+                str(fake_milvus),
+                str(db),
+                f"unix:{tmp_path}/{db.parent.name}.sock",
+                "ERROR",
+                f"{db.parent}/.milvus.db.lock",
+            ]
+        )
+
+    own = spawn(own_db)
+    other = spawn(other_db)
+    try:
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        _write_executable(
+            fake_bin / "memsearch",
+            """#!/usr/bin/env bash
+if [ "$1 $2 $3" = "config get milvus.uri" ]; then echo "$TEST_MILVUS_URI"; fi
+""",
+        )
+        # Only report our fake servers, so the sweep can never touch real ones.
+        _write_executable(
+            fake_bin / "pgrep",
+            """#!/usr/bin/env bash
+case "$*" in
+  *milvus_lite/lib/milvus*) printf '%s\n' $TEST_MILVUS_PIDS ;;
+  *) exit 1 ;;
+esac
+""",
+        )
+        env = {k: v for k, v in os.environ.items() if k not in ("MILVUS_URI", "MEMSEARCH_NO_WATCH")}
+        env.update(
+            {
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "CLAUDE_PROJECT_DIR": str(tmp_path),
+                "MEMSEARCH_PROJECT_DIR": str(tmp_path),
+                "MEMSEARCH_DIR": str(tmp_path / ".memsearch"),
+                "TEST_MILVUS_URI": milvus_uri,
+                "TEST_MILVUS_PIDS": f"{own.pid} {other.pid}",
+            }
+        )
+
+        subprocess.run(
+            ["bash", "-c", 'source "$1" < /dev/null && kill_orphaned_index', "bash", str(Path(common_sh).resolve())],
+            cwd=tmp_path,
+            env=env,
+            check=True,
+        )
+
+        if expect_own_killed:
+            assert own.wait(timeout=5) == -signal.SIGTERM
+        else:
+            time.sleep(0.2)
+            assert own.poll() is None
+        assert other.poll() is None, "sweep killed a Milvus Lite server it does not own"
+    finally:
+        for proc in (own, other):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
