@@ -6,6 +6,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -935,8 +936,6 @@ echo "- User discussed a macOS stop hook regression."
     ("milvus_uri", "expected_index_calls", "expected_pgrep_calls"),
     [
         ("/tmp/memsearch-lite.db", 0, 0),
-        # Server mode sweeps stale index processes only: there is no memsearch
-        # Milvus Lite server to look for.
         ("http://127.0.0.1:19530", 1, 1),
         ("tcp://127.0.0.1:19530", 1, 1),
     ],
@@ -2190,92 +2189,99 @@ def test_version_gt_orders_supported_versions(common_sh: str) -> None:
     assert got == want, [(c, g, w) for c, g, w in zip(cases, got, want, strict=True) if g != w]
 
 
-@pytest.mark.parametrize(
-    ("milvus_uri", "expect_own_killed"),
-    [("~/.memsearch/milvus.db", True), ("http://127.0.0.1:19530", False)],
-    ids=["lite", "server"],
-)
 @pytest.mark.parametrize("common_sh", COMMON_SHS, ids=PLUGIN_IDS)
-def test_kill_orphaned_index_only_kills_memsearch_milvus_lite(
-    tmp_path: Path, common_sh: str, milvus_uri: str, expect_own_killed: bool
+@pytest.mark.parametrize("milvus_uri", ["local", "http://127.0.0.1:19530", "tcp://127.0.0.1:19530"])
+@pytest.mark.parametrize("mode", ["pidfile", "missing-pidfile", "child-guard"])
+def test_index_cleanup_preserves_active_lite_services(
+    tmp_path: Path, common_sh: str, milvus_uri: str, mode: str
 ) -> None:
-    """The sweep must not SIGTERM Milvus Lite servers owned by other apps on the
-    machine: only the one serving memsearch's own database file."""
+    """Stop previous index tasks without terminating other database owners' services."""
     home = tmp_path / "home"
-    (home / ".memsearch").mkdir(parents=True)
-    own_db = home / ".memsearch" / "milvus.db"
-    own_db.touch()
-    other_db = tmp_path / "other-app" / "milvus.db"
-    other_db.parent.mkdir()
-    other_db.touch()
-
-    # Stand-in for the milvus_lite server binary; argv mirrors milvus_lite's
-    # Server.args: <db> <uds> <log level> <lock>, with the db path fully resolved.
-    fake_milvus = tmp_path / "site-packages" / "milvus_lite" / "lib" / "milvus"
+    memsearch_dir = tmp_path / ".memsearch"
+    fake_bin = tmp_path / "bin"
+    for folder in (home, memsearch_dir, fake_bin):
+        folder.mkdir()
+    own_db = tmp_path / "index.db"
+    other_db = tmp_path / "other app" / "index.db"
+    fake_milvus = fake_bin / "milvus_lite" / "lib" / "milvus"
     fake_milvus.parent.mkdir(parents=True)
-    _write_executable(fake_milvus, "#!/usr/bin/env bash\nsleep 60\n")
+    # These stand-ins model process ownership, not database behavior. Restore TERM
+    # in case the test runner ignores it, and use a readiness line before cleanup.
+    sleeper = (
+        f"#!{sys.executable}\n"
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    _write_executable(fake_milvus, sleeper)
+    _write_executable(fake_bin / "index-task", sleeper)
+    processes = []
 
-    def spawn(db: Path) -> subprocess.Popen:
-        db = db.resolve()
-        return subprocess.Popen(
-            [
-                str(fake_milvus),
-                str(db),
-                f"unix:{tmp_path}/{db.parent.name}.sock",
-                "ERROR",
-                f"{db.parent}/.milvus.db.lock",
-            ]
-        )
+    def spawn(argv: list[str]) -> subprocess.Popen:
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+        processes.append(process)
+        assert process.stdout.readline().strip() == "ready"
+        return process
 
-    own = spawn(own_db)
-    other = spawn(other_db)
     try:
-        fake_bin = tmp_path / "bin"
-        fake_bin.mkdir()
+        index = spawn([str(fake_bin / "index-task")])
+        own = spawn([str(fake_milvus), str(own_db), "unix:test.sock", "ERROR"])
+        other = spawn([str(fake_milvus), str(other_db), "unix:other.sock", "ERROR"])
+        pidfile = memsearch_dir / ".index.pid"
+        if mode != "missing-pidfile":
+            pidfile.write_text(str(index.pid), encoding="utf-8")
         _write_executable(
             fake_bin / "memsearch",
-            """#!/usr/bin/env bash
-if [ "$1 $2 $3" = "config get milvus.uri" ]; then echo "$TEST_MILVUS_URI"; fi
-""",
+            '#!/usr/bin/env bash\nif [ "$*" = "config get milvus.uri" ]; then echo "$TEST_MILVUS_URI"; fi\n',
         )
-        # Only report our fake servers, so the sweep can never touch real ones.
+        # Limit process discovery to this test's PIDs, including when testing the
+        # old sweep. Never allow the hook to discover unrelated real processes.
         _write_executable(
             fake_bin / "pgrep",
             """#!/usr/bin/env bash
 case "$*" in
-  *milvus_lite/lib/milvus*) printf '%s\n' $TEST_MILVUS_PIDS ;;
+  *milvus_lite/lib/milvus*) printf '%s\n' "$TEST_OWN_PID" "$TEST_OTHER_PID" ;;
+  *'memsearch index '*) printf '%s\n' "$TEST_INDEX_PID" ;;
   *) exit 1 ;;
 esac
 """,
         )
-        env = {k: v for k, v in os.environ.items() if k not in ("MILVUS_URI", "MEMSEARCH_NO_WATCH")}
-        env.update(
-            {
-                "HOME": str(home),
-                "PATH": f"{fake_bin}:{os.environ['PATH']}",
-                "CLAUDE_PROJECT_DIR": str(tmp_path),
-                "MEMSEARCH_PROJECT_DIR": str(tmp_path),
-                "MEMSEARCH_DIR": str(tmp_path / ".memsearch"),
-                "TEST_MILVUS_URI": milvus_uri,
-                "TEST_MILVUS_PIDS": f"{own.pid} {other.pid}",
-            }
-        )
-
+        env = {
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "CLAUDE_PROJECT_DIR": str(tmp_path),
+            "MEMSEARCH_PROJECT_DIR": str(tmp_path),
+            "MEMSEARCH_DIR": str(memsearch_dir),
+            "TEST_MILVUS_URI": str(own_db) if milvus_uri == "local" else milvus_uri,
+            "TEST_INDEX_PID": str(index.pid),
+            "TEST_OWN_PID": str(own.pid),
+            "TEST_OTHER_PID": str(other.pid),
+        }
+        if mode == "child-guard":
+            env["MEMSEARCH_NO_WATCH"] = "1"
         subprocess.run(
-            ["bash", "-c", 'source "$1" < /dev/null && kill_orphaned_index', "bash", str(Path(common_sh).resolve())],
+            ["bash", "-c", 'source "$1" < /dev/null; kill_orphaned_index', "bash", str(Path(common_sh).resolve())],
             cwd=tmp_path,
             env=env,
+            capture_output=True,
+            text=True,
             check=True,
+            timeout=10,
         )
-
-        if expect_own_killed:
-            assert own.wait(timeout=5) == -signal.SIGTERM
+        if mode == "child-guard":
+            assert index.poll() is None
+            assert pidfile.exists()
         else:
-            time.sleep(0.2)
-            assert own.poll() is None
-        assert other.poll() is None, "sweep killed a Milvus Lite server it does not own"
+            assert index.wait(timeout=5) == -signal.SIGTERM
+            assert not pidfile.exists()
+        # Waiting briefly also observes asynchronously delivered SIGTERM.
+        time.sleep(0.1)
+        assert own.poll() is None, "cleanup interrupted an active holder of the configured database"
+        assert other.poll() is None, "cleanup interrupted another application's database"
     finally:
-        for proc in (own, other):
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            process.stdout.close()
